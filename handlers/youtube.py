@@ -7,7 +7,7 @@ from requests import HTTPError
 from rich.pretty import pprint
 from rich import inspect
 
-from aiogram import Bot, Dispatcher, executor, types
+from aiogram import Bot, Dispatcher, types
 from yaml import load, dump, Loader
 
 from odesli.Odesli import Odesli

@@ -55,10 +55,10 @@ async def help_start(event: types.Message):
         .replace("[", "\\[")
         .replace("`", "\\`")
     )
-    msg = "Hey, I'm *{}*\n".format(bot_name)
-    msg += "_You can use me in inline mode :_\n"
+    msg = "Hey, Je Suis *{}*\n".format(bot_name)
+    msg += "_Tu Peut Utiliser le Mode inline mode :_\n"
     msg += "@{} \\(album\\|track\\|artist\\) \\<search\\>\n".format(bot_username)
-    msg += "Or just send an *Deezer* album, track *link* or YouTube *link*"
+    msg += "Ou un lien  *Deezer* album, track *link* or YouTube *link*"
     await event.answer(msg, parse_mode="MarkdownV2")
 
 

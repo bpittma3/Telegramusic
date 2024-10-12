@@ -1,161 +1,174 @@
-import asyncio
-import io
-import os
-import traceback
-from pathlib import Path
+from youtubesearchpython.__future__ import VideosSearch
 
+import re
 import requests
-from PIL import Image
-from aiogram import F, types
-from aiogram.types import BufferedInputFile, FSInputFile
-from mutagen.id3 import ID3, error, APIC
-from mutagen.mp3 import MP3
+from requests import HTTPError
+
+from rich.pretty import pprint
+from rich import inspect
+
+from aiogram import Bot, Dispatcher, executor, types
+from yaml import load, dump, Loader
+
+from odesli.Odesli import Odesli
 from yt_dlp import YoutubeDL
-from aiogram import Router
+from spotipy import Spotify, SpotifyClientCredentials
 
-from utils import __, is_downloading, add_downloading, remove_downloading, TMP_DIR
+from os import mkdir, remove, walk
+from os.path import exists
 
-youtube_router = Router()
+from logger import Logger
 
-COOKIES_PATH = os.environ.get("COOKIES_PATH")
-
-YT_TMP_DIR = Path(TMP_DIR, "yt")
-
-
-def crop_center(pil_img, crop_width, crop_height):
-    img_width, img_height = pil_img.size
-    return pil_img.crop(
-        (
-            (img_width - crop_width) // 2,
-            (img_height - crop_height) // 2,
-            (img_width + crop_width) // 2,
-            (img_height + crop_height) // 2,
-        )
-    )
+# TODO:
+# - Add support for playlists/albums for Spotify and Youtube
+#   - Ability to stop downloading
+# - Multiple pages in search results
+# - Add metadata to MP3 files
+# - Spotify search
+# - "Cache" channel with songs
 
 
-@youtube_router.message(
-    F.text.regexp(
-        r"(?:http?s?:\/\/)?(?:www.)?(?:m.)?(?:music.)?youtu(?:\.?be)(?:\.com)?(?:("
-        r"?:\w*.?:\/\/)?\w*.?\w*-?.?\w*\/(?:embed|e|v|watch|.*\/)?\??(?:feature=\w*\.?\w*)?&?("
-        r"?:v=)?\/?)([\w\d_-]{11})(?:\S+)?"
-    )
-)
-async def get_youtube_audio(event: types.Message):
-    print(event.from_user)
-    if is_downloading(event.from_user.id) is False:
-        add_downloading(event.from_user.id)
-        tmp_msg = await event.answer(__("downloading"))
-        try:
-            ydl_opts = {
-                "outtmpl": str(YT_TMP_DIR) + "/%(id)s.%(ext)s",
-                "format": "bestaudio/best",
-                "postprocessors": [
-                    {
-                        "key": "FFmpegExtractAudio",
-                        "preferredcodec": "mp3",
-                        "preferredquality": "320",
-                    }
-                ],
-            }
+url_regex = r"^(https?:\/\/)?([\da-z\.-]+\.[a-z\.]{2,6})(.*)\/?#?$"
+youtube_domains = ("m.youtube.com", "youtube.com", "www.youtube.com", "youtu.be", "music.youtube.com")
+spotify_domains = ("open.spotify.com",)
+spotify_regex = {
+    "track": r"(?:https:\/\/open\.spotify\.com\/playlist\/|spotify:playlist:)([a-zA-Z0-9]+)",
+    "album": r"(?:https:\/\/open\.spotify\.com\/album\/|spotify:album:)([a-zA-Z0-9]+)"
+}
 
-            # if cookies.txt exists, use it
-            if (
-                COOKIES_PATH is not None
-                and os.path.exists(COOKIES_PATH)
-                and os.path.isfile(COOKIES_PATH)
-                and os.path.getsize(COOKIES_PATH) > 0
-            ):
-                print("Using cookies")
-                ydl_opts["cookiefile"] = COOKIES_PATH
+log = Logger()
+config = load(open("config.yml"), Loader=Loader)
+bot = Bot(config["bot_token"])
+dp = Dispatcher(bot)
+odesli = Odesli()
+ytdl = YoutubeDL({
+    "format": "bestaudio/best",
+    "outtmpl": "cache/%(id)s.%(ext)s",
+    "username": "oauth2",
+    "password": "",
+    "postprocessors": [{
+        "key": "FFmpegExtractAudio",
+        "preferredcodec": "mp3",
+        "preferredquality": "320",
+    }],
+})
+spotify = Spotify(auth_manager=SpotifyClientCredentials(
+    client_id=config["spotify_id"],
+    client_secret=config["spotify_secret"]
+))
 
-            # Download file
-            ydl = YoutubeDL(ydl_opts)
-            dict_info = ydl.extract_info(event.text, download=True)
+if not exists("cache"):
+    mkdir("cache")
+else:
+    if w := walk("cache"):
+        log.info("Clearing cache...")
+        for f in w:
+            for file in f[2]:
+                log.info(f"Removing [yellow]{f[0]}/{file}[/]")
+                remove(f[0] + "/" + file)
 
-            thumb = dict_info["thumbnail"]
 
-            # Get thumb
-            content = requests.get(thumb).content
+def save_url(url: str, path: str):
+    r = requests.get(url)
+    with open(path, "wb") as out:
+        out.write(r.content)
+    return path
 
-            upload_date = "Unknown date"
-            try:
-                if dict_info is not None and dict_info["upload_date"] is not None:
-                    upload_date = dict_info["upload_date"]
-                    upload_date = (
-                        upload_date[6:8]
-                        + "/"
-                        + upload_date[4:6]
-                        + "/"
-                        + upload_date[0:4]
-                    )
-            except:
-                pass
 
-            # Send cover
-            image_bytes = io.BytesIO(content)
-            await event.answer_photo(
-                BufferedInputFile(image_bytes.read(), filename="cover.jpg"),
-                caption=(
-                    "<b>Track: {}</b>"
-                    '\n{} - {}\n\n<a href="{}">' + __("track_link") + "</a>"
-                ).format(
-                    dict_info["title"],
-                    dict_info["uploader"],
-                    upload_date,
-                    "https://youtu.be/" + dict_info["id"],
-                ),
-                parse_mode="HTML",
-            )
+async def handle_song(message: types.Message, song, meta, song_link: str):
+    log.info(f"Downloading [blue]{song.id}[/]")
+    await message.edit_text("⏳ Downloading...")
+    ytdl.download(list(song.linksByPlatform.values())[:1])
 
-            # Delete user message
-            await event.delete()
+    log.info(f"Saving thumbnail for [blue]{song.id}[/]")
+    thumb = save_url(meta.thumbnailUrl, f"cache/{song.id}.jpg")
 
-            location = Path(YT_TMP_DIR) / f"{dict_info['id']}.mp3"
+    log.info(f"Sending [blue]{song.id}[/]")
+    await message.edit_text("⏳ Uploading...")
+    await message.answer_audio(types.InputFile(f"cache/{song.id}.mp3"),
+                               caption=f"_[song\\.link]({song_link})_",
+                               parse_mode="MarkdownV2",
+                               performer=meta.artistName,
+                               title=meta.title,
+                               thumb=open(thumb, "rb"))
+    await message.delete()
+    remove(thumb)
+    remove(f"cache/{song.id}.mp3")
 
-            # TAG audio
-            audio = MP3(location, ID3=ID3)
-            try:
-                audio.add_tags()
-            except error:
-                pass
-            audio.tags.add(
-                APIC(mime="image/jpeg", type=3, desc="Cover", data=image_bytes.read())
-            )
-            audio.save()
 
-            # Create thumb
-            roi_img = crop_center(Image.open(image_bytes), 80, 80)
-            img_byte_arr = io.BytesIO()
-            if roi_img.mode in ("RGBA", "P"):
-                roi_img = roi_img.convert("RGB")
-            roi_img.save(img_byte_arr, format="jpeg")
-
-            # Send audio
-            await event.answer_audio(
-                FSInputFile(location),
-                title=dict_info["title"],
-                performer=dict_info["uploader"],
-                thumbnail=BufferedInputFile(
-                    img_byte_arr.getvalue(), filename="thumb.jpg"
-                ),
-                disable_notification=True,
-            )
-            try:
-                os.remove(location)
-            except FileNotFoundError:
-                pass
-        except Exception as e:
-            traceback.print_exc()
-            await event.answer(__("download_error") + " " + str(e))
-        finally:
-            await tmp_msg.delete()
-            try:
-                remove_downloading(event.from_user.id)
-            except ValueError:
-                pass
+async def handle_youtube(message: types.Message, url: str):
+    new = await message.answer("⏳ Acquiring metadata...")
+    result = odesli.getByUrl(url)
+    yt = result.songsByProvider["youtube"]
+    meta = result.songsByProvider["youtube"]
+    if "spotify" in result.songsByProvider.keys():
+        meta = result.songsByProvider["spotify"]
     else:
-        tmp_err_msg = await event.answer(__("running_download"))
-        await event.delete()
-        await asyncio.sleep(2)
-        await tmp_err_msg.delete()
+        log.warn(f"No Spotify link found for {url}")
+
+    await handle_song(new, yt, meta, result.songLink)
+
+
+@dp.message_handler(regexp=url_regex)
+async def handle_url(message: types.Message):
+    # TODO: Add support for playlists (so far only Spotify and Youtube)
+    new = await message.reply("⏳ Acquiring metadata...")
+    try:
+        log.info(f"Got text: [blue]{message.text}[/] from [blue]{message.from_user.full_name}[/] / [blue]{message.from_user.id}[/]")
+        result = odesli.getByUrl(message.text)
+        if "youtube" not in result.songsByProvider.keys():
+            log.warn(f"No YouTube link found for [yellow]{message.text}[/]")
+            await message.reply("⚠ Song not found!")
+            return
+        yt = result.songsByProvider["youtube"]
+        meta = result.songsByProvider["youtube"]
+        if "spotify" in result.songsByProvider.keys():
+            meta = result.songsByProvider["spotify"]
+        else:
+            log.warn(f"No Spotify link found for [yellow]{message.text}[/]")
+        await handle_song(new, yt, meta, result.songLink)
+    except HTTPError as e:
+        if e.response.status_code >= 400 and e.response.status_code < 500:
+            log.warn(f"Code {e.response.status_code} for {message.text}")
+            await new.edit_text("⚠ Song not found!")
+            return
+        else:
+            log.console.print_exception()
+            await new.edit_text("⚠ Unknown HTTP error occurred!")
+    except Exception:
+        log.console.print_exception()
+        await new.edit_text("⚠ Unknown error occurred!")
+        return
+
+
+@dp.message_handler()
+async def handle_text(message: types.Message):
+    log.info(f"Got text: [blue]{message.text}[/] from [blue]{message.from_user.full_name}[/] / [blue]{message.from_user.id}[/]")
+    log.info(f"Searching [blue]{message.text}[/]")
+    new = await message.reply("⏳ Searching...")
+
+    search = VideosSearch(message.text, limit=config["search_limit"])
+    results = (await search.next())["result"]
+    log.info(f"Got {len(results)} results")
+    if len(results) == 0:
+        await new.edit_text("🔎 No results found")
+        return
+
+    buttons = []
+    for vid in results:
+        buttons.append([
+            types.InlineKeyboardButton(text=f"{vid['title']} - {vid['channel']['name']}", callback_data=vid["link"])
+        ])
+    await new.edit_text("🔎 Search results", reply_markup=types.InlineKeyboardMarkup(row_width=1, inline_keyboard=buttons))
+
+
+@dp.callback_query_handler()
+async def handle_callback(query: types.CallbackQuery):
+    log.info(f"Got callback: [blue]{query.data}[/] from [blue]{query.from_user.full_name}[/] / [blue]{query.from_user.id}[/]")
+    await query.answer()
+    await handle_youtube(query.message, query.data)
+
+
+if __name__ == "__main__":
+    log.info("Starting polling...")
+    executor.start_polling(dp, skip_updates=True)
